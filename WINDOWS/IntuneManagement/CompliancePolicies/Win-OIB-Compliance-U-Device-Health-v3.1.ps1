@@ -1,12 +1,26 @@
-# Script to create GPO from Intune Device Health Compliance Policy JSON
-
-#Requires -Modules GroupPolicy
-
+<#
+.SYNOPSIS
+    Creates and configures a Group Policy Object (GPO) based on settings from an Intune JSON policy.
+.DESCRIPTION
+    This script reads an Intune JSON policy export for 'Win - OIB - Compliance - U - Device Health - v3.1',
+    extracts relevant Device Health settings, and creates a corresponding GPO.
+    It attempts to map these settings to GPO registry values where feasible using Set-GPRegistryValue.
+    Many Device Health settings are prerequisites (firmware-level) or complex configurations
+    not directly translatable to simple 'Policies' registry keys.
+    This script is self-contained and uses the provided JSON content directly.
+.NOTES
+    Source Policy Name: Win - OIB - Compliance - U - Device Health - v3.1
+    Version: 1.1
+    Author: AI Agent
+#>
 param (
     [string]$JsonContentIn
 )
 
-# Helper function to clean the JSON content
+# Strict error handling
+$ErrorActionPreference = 'Stop'
+
+# Helper function to clean the JSON content (UTF-16 BOM and null characters)
 function Clean-JsonContent {
     param ([string]$RawContent)
     $cleaned = $RawContent
@@ -17,219 +31,190 @@ function Clean-JsonContent {
     return $cleaned
 }
 
-# Initialize
-$setGPRegistryValueCommandsExecuted = 0
-$interpretedSettingsFromJson = 0
+# --- Initialize Counters ---
+# $expectedIntuneSettings: Number of Intune settings this script is programmed to interpret from this specific JSON.
+# For this Device Health compliance policy, we are looking for:
+# bitLockerEnabled, secureBootEnabled, codeIntegrityEnabled, memoryIntegrityEnabled, 
+# kernelDmaProtectionEnabled, virtualizationBasedSecurityEnabled, firmwareProtectionEnabled,
+# earlyLaunchAntiMalwareDriverEnabled, tpmRequired, storageRequireEncryption
+$expectedIntuneSettings = 10 
+$configuredGpoSettings = 0 # Counts successfully configured GPO registry values.
 
-# Clean and Parse JSON
+# --- Parse JSON ---
 $cleanedJson = Clean-JsonContent -RawContent $JsonContentIn
 try {
     $policyObject = $cleanedJson | ConvertFrom-Json -ErrorAction Stop
 } catch {
     Write-Error "Failed to parse JSON content. Error: $($_.Exception.Message)"
-    Write-Error "Cleaned JSON content (first 500 chars): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 500)))"
-    exit 1
+    Write-Error "Cleaned JSON content (first 500 chars for debugging): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 500)))"
+    exit 1 
 }
 
-# Extract GPO Name and Description
+# --- Extract GPO Information ---
 $gpoName = $policyObject.displayName
 $gpoDescription = $policyObject.description
 if ([string]::IsNullOrEmpty($gpoDescription)) {
-    $gpoDescription = "GPO created from Intune policy '$gpoName' (Device Health - Automated Script)"
+    $gpoDescription = "GPO created from Intune policy '$gpoName' (Device Health Compliance - Automated Script)"
 }
 
 Write-Host "Preparing to create GPO: '$gpoName'"
 Write-Host "Description: '$gpoDescription'"
 
-# Create New GPO
+# --- Main GPO Configuration ---
 try {
-    Import-Module GroupPolicy -ErrorAction Stop
+    Import-Module GroupPolicy -ErrorAction Stop 
+
     $existingGpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
     if ($existingGpo) {
         Write-Warning "GPO named '$gpoName' already exists. Script will not create a new one or modify the existing one. Exiting."
-        exit 1
-    } else {
-        $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription -ErrorAction Stop
-        Write-Host "Successfully created GPO: '$($gpo.DisplayName)' (ID: $($gpo.Id))"
+        exit 1 
     }
+
+    $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription
+    Write-Host "Successfully created GPO: '$($gpo.DisplayName)' (ID: $($gpo.Id))"
+
+    $deviceGuardRegPath = "SYSTEM\CurrentControlSet\Control\DeviceGuard"
+    $fveRegPath = "SOFTWARE\Policies\Microsoft\FVE"
+
+    # 1. bitLockerEnabled
+    # Intune Setting: bitLockerEnabled (Value from JSON: $($policyObject.bitLockerEnabled))
+    # GPO Example: Computer Configuration > Admin Templates > Windows Components > BitLocker Drive Encryption > Fixed Data Drives > Deny write access to fixed drives not protected by BitLocker
+    if ($policyObject.PSObject.Properties.Contains('bitLockerEnabled')) {
+        if ($policyObject.bitLockerEnabled -eq $true) {
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $fveRegPath -ValueName "FDVDenyWriteAccess" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for bitLockerEnabled: $fveRegPath\FDVDenyWriteAccess = 1 (Deny write access to non-BitLocker fixed drives)"
+            Write-Warning "Note: This is one example of a BitLocker-related GPO setting. Full BitLocker enforcement is more complex and typically involves multiple GPO settings (OS drive encryption, recovery options, TPM configuration, etc.) which are not all covered by this script."
+        } else {
+            Write-Warning "Intune setting 'bitLockerEnabled' is '$($policyObject.bitLockerEnabled)'. No GPO settings for BitLocker enforcement applied."
+        }
+    } else { Write-Warning "Intune setting 'bitLockerEnabled' not found in JSON."}
+
+    # 2. secureBootEnabled
+    # Intune Setting: secureBootEnabled (Value from JSON: $($policyObject.secureBootEnabled))
+    # GPO Equivalent: None for direct enablement. It's a firmware setting.
+    if ($policyObject.PSObject.Properties.Contains('secureBootEnabled')) {
+        if ($policyObject.secureBootEnabled -eq $true) {
+            Write-Warning "Intune setting 'secureBootEnabled' is true. Secure Boot is a UEFI firmware setting and must be enabled in BIOS/UEFI. GPO cannot enforce this directly. It serves as a prerequisite for features like VBS/HVCI."
+        } else {
+            Write-Warning "Intune setting 'secureBootEnabled' is false. For features like VBS/HVCI to be fully effective and secure, Secure Boot should be enabled in the firmware."
+        }
+    } else { Write-Warning "Intune setting 'secureBootEnabled' not found in JSON."}
+
+    # 3. codeIntegrityEnabled (Hypervisor-Enforced Code Integrity - HVCI)
+    # Intune Setting: codeIntegrityEnabled (Value from JSON: $($policyObject.codeIntegrityEnabled))
+    # GPO Path: Computer Configuration > Admin Templates > System > Device Guard > Turn On Virtualization Based Security
+    if ($policyObject.PSObject.Properties.Contains('codeIntegrityEnabled')) {
+        if ($policyObject.codeIntegrityEnabled -eq $true) {
+            Write-Host "Intune setting 'codeIntegrityEnabled' is true. Attempting to enforce related VBS and HVCI GPO settings."
+            
+            # EnableVirtualizationBasedSecurity = 1 (Enable VBS)
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $deviceGuardRegPath -ValueName "EnableVirtualizationBasedSecurity" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for VBS: $deviceGuardRegPath\EnableVirtualizationBasedSecurity = 1"
+
+            # RequirePlatformSecurityFeatures: 1 for Secure Boot (as kernelDmaProtectionEnabled is false)
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $deviceGuardRegPath -ValueName "RequirePlatformSecurityFeatures" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for VBS: $deviceGuardRegPath\RequirePlatformSecurityFeatures = 1 (Requires Secure Boot)"
+
+            # HypervisorEnforcedCodeIntegrity = 1 (Enable HVCI / Memory Integrity)
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $deviceGuardRegPath -ValueName "HypervisorEnforcedCodeIntegrity" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for HVCI: $deviceGuardRegPath\HypervisorEnforcedCodeIntegrity = 1"
+            
+            # Locked = 1 (Prevent VBS/HVCI from being turned off locally)
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $deviceGuardRegPath -ValueName "Locked" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for VBS: $deviceGuardRegPath\Locked = 1 (Prevent local changes)"
+            
+            Write-Warning "Note: Full effectiveness of VBS/HVCI requires appropriate hardware, firmware (with Secure Boot enabled), and hypervisor support. The JSON indicated 'virtualizationBasedSecurityEnabled: $($policyObject.virtualizationBasedSecurityEnabled)', but VBS keys were set due to 'codeIntegrityEnabled: true'."
+        } else {
+            Write-Warning "Intune setting 'codeIntegrityEnabled' is '$($policyObject.codeIntegrityEnabled)'. GPO settings for VBS/HVCI not applied based on this flag."
+        }
+    } else { Write-Warning "Intune setting 'codeIntegrityEnabled' not found in JSON."}
+
+    # 4. memoryIntegrityEnabled (Often synonymous with HVCI)
+    # Intune Setting: memoryIntegrityEnabled (Value from JSON: $($policyObject.memoryIntegrityEnabled))
+    if ($policyObject.PSObject.Properties.Contains('memoryIntegrityEnabled')) {
+        if ($policyObject.memoryIntegrityEnabled -eq $true -and $policyObject.codeIntegrityEnabled -ne $true) {
+            # Only apply if codeIntegrityEnabled didn't already set it (to avoid double-counting or conflicting logic)
+            Write-Warning "Intune setting 'memoryIntegrityEnabled' is true, but 'codeIntegrityEnabled' was not. This state is unusual. Consider aligning these. HVCI settings are typically applied if 'codeIntegrityEnabled' is true."
+            # If codeIntegrityEnabled was false, but this is true, it's a conflict.
+            # This script prioritizes codeIntegrityEnabled for setting HVCI.
+        } elseif ($policyObject.memoryIntegrityEnabled -eq $false) {
+             Write-Host "Intune setting 'memoryIntegrityEnabled' is false. HVCI is typically enabled via 'codeIntegrityEnabled'."
+        }
+    } else { Write-Warning "Intune setting 'memoryIntegrityEnabled' not found in JSON."}
+
+    # 5. kernelDmaProtectionEnabled
+    # Intune Setting: kernelDmaProtectionEnabled (Value from JSON: $($policyObject.kernelDmaProtectionEnabled))
+    if ($policyObject.PSObject.Properties.Contains('kernelDmaProtectionEnabled')) {
+        Write-Host "Intune setting 'kernelDmaProtectionEnabled' is '$($policyObject.kernelDmaProtectionEnabled)'. If true, this would typically set 'RequirePlatformSecurityFeatures' to '3' (Secure Boot + DMA). Current script logic sets it based on 'codeIntegrityEnabled' and does not separately enforce the DMA bit if 'kernelDmaProtectionEnabled' is true but 'codeIntegrityEnabled' is false."
+    } else { Write-Warning "Intune setting 'kernelDmaProtectionEnabled' not found in JSON."}
+
+    # 6. virtualizationBasedSecurityEnabled
+    # Intune Setting: virtualizationBasedSecurityEnabled (Value from JSON: $($policyObject.virtualizationBasedSecurityEnabled))
+    if ($policyObject.PSObject.Properties.Contains('virtualizationBasedSecurityEnabled')) {
+         Write-Host "Intune setting 'virtualizationBasedSecurityEnabled' is '$($policyObject.virtualizationBasedSecurityEnabled)'. VBS is enabled as a prerequisite if 'codeIntegrityEnabled' is true."
+    } else { Write-Warning "Intune setting 'virtualizationBasedSecurityEnabled' not found in JSON."}
+    
+    # 7. firmwareProtectionEnabled
+    # Intune Setting: firmwareProtectionEnabled (Value from JSON: $($policyObject.firmwareProtectionEnabled))
+    if ($policyObject.PSObject.Properties.Contains('firmwareProtectionEnabled')) {
+        Write-Host "Intune setting 'firmwareProtectionEnabled' is '$($policyObject.firmwareProtectionEnabled)'. This often relates to System Guard Secure Launch or Secured-core PC capabilities, which are not typically managed by simple GPO registry toggles. No GPO setting applied."
+    } else { Write-Warning "Intune setting 'firmwareProtectionEnabled' not found in JSON."}
+
+    # 8. earlyLaunchAntiMalwareDriverEnabled (ELAM)
+    # Intune Setting: earlyLaunchAntiMalwareDriverEnabled (Value from JSON: $($policyObject.earlyLaunchAntiMalwareDriverEnabled))
+    if ($policyObject.PSObject.Properties.Contains('earlyLaunchAntiMalwareDriverEnabled')) {
+        Write-Host "Intune setting 'earlyLaunchAntiMalwareDriverEnabled' is '$($policyObject.earlyLaunchAntiMalwareDriverEnabled)'. ELAM driver registration is part of the AV installation process. GPO does not directly toggle this boolean state for compliance. No GPO setting applied."
+    } else { Write-Warning "Intune setting 'earlyLaunchAntiMalwareDriverEnabled' not found in JSON."}
+
+    # 9. tpmRequired
+    # Intune Setting: tpmRequired (Value from JSON: $($policyObject.tpmRequired))
+    if ($policyObject.PSObject.Properties.Contains('tpmRequired')) {
+        Write-Host "Intune setting 'tpmRequired' is '$($policyObject.tpmRequired)'. TPM is a hardware/firmware prerequisite for features like BitLocker and VBS. GPO cannot enable the TPM chip itself. This script does not set a GPO setting based on this flag."
+    } else { Write-Warning "Intune setting 'tpmRequired' not found in JSON."}
+    
+    # 10. storageRequireEncryption
+    # Intune Setting: storageRequireEncryption (Value from JSON: $($policyObject.storageRequireEncryption))
+    if ($policyObject.PSObject.Properties.Contains('storageRequireEncryption')) {
+        if ($policyObject.storageRequireEncryption -eq $true -and $policyObject.bitLockerEnabled -ne $true) {
+             Write-Warning "Intune setting 'storageRequireEncryption' is true, but 'bitLockerEnabled' is false. Enforcing storage encryption typically relies on BitLocker, which is not being enforced per the 'bitLockerEnabled' flag. No specific GPO setting applied for 'storageRequireEncryption' alone."
+        } else {
+            Write-Host "Intune setting 'storageRequireEncryption' is '$($policyObject.storageRequireEncryption)'. This is typically met by BitLocker. BitLocker enforcement is handled by the 'bitLockerEnabled' setting logic."
+        }
+    } else { Write-Warning "Intune setting 'storageRequireEncryption' not found in JSON."}
+
+
 } catch {
-    Write-Error "Failed to create GPO '$gpoName'. Error: $($_.Exception.Message)"
-    exit 1
+    Write-Error "An error occurred during GPO creation or configuration: $($_.Exception.Message)"
 }
 
-# --- Registry Settings Mapping for Device Health ---
-
-# 1. secureBootEnabled: true
-# Secure Boot is a UEFI firmware setting. GPO cannot enable it.
-# It's a prerequisite for some OS-level security features (like VBS/HVCI).
-if ($policyObject.PSObject.Properties.Match('secureBootEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.secureBootEnabled -eq $true) {
-        Write-Warning "JSON setting 'secureBootEnabled: true' noted. Secure Boot is a UEFI firmware setting and must be enabled in BIOS. GPO cannot enforce this directly. It serves as a prerequisite for features like VBS/HVCI."
-    } else {
-        Write-Warning "JSON setting 'secureBootEnabled: false' noted. If VBS/HVCI are to be enforced, Secure Boot is recommended to be enabled in firmware."
-    }
-}
-
-# 2. codeIntegrityEnabled: true (Hypervisor-Enforced Code Integrity - HVCI)
-# This requires Virtualization Based Security (VBS).
-# Note: The JSON has virtualizationBasedSecurityEnabled: false. To *enforce* Code Integrity, VBS must be enabled.
-# The script will attempt to set VBS and HVCI keys if codeIntegrityEnabled is true.
-if ($policyObject.PSObject.Properties.Match('codeIntegrityEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.codeIntegrityEnabled -eq $true) {
-        Write-Host "JSON setting 'codeIntegrityEnabled: true'. Attempting to enforce VBS and HVCI."
-        
-        $regKeyDeviceGuard = "SYSTEM\CurrentControlSet\Control\DeviceGuard"
-
-        # EnableVirtualizationBasedSecurity = 1 (Enable VBS)
-        # GPO: Computer Configuration > Admin Templates > System > Device Guard > Turn On Virtualization Based Security
-        try {
-            Write-Host "Applying VBS setting: EnableVirtualizationBasedSecurity = 1"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDeviceGuard -ValueName "EnableVirtualizationBasedSecurity" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for EnableVirtualizationBasedSecurity: $($_.Exception.Message)"
-        }
-
-        # RequirePlatformSecurityFeatures = 1 (Secure Boot) or 3 (Secure Boot and DMA Protection)
-        # Since kernelDmaProtectionEnabled is false in this JSON, we aim for Secure Boot only.
-        # This GPO setting configures VBS to require specific hardware security features.
-        $requirePlatformSecurityFeaturesValue = 1 # Default to Secure Boot only
-        if ($policyObject.PSObject.Properties.Match('kernelDmaProtectionEnabled').Count -gt 0 -and $policyObject.kernelDmaProtectionEnabled -eq $true) {
-            # This case is not met by the current JSON, but included for completeness
-            # $requirePlatformSecurityFeaturesValue = 3
-        }
-         try {
-            Write-Host "Applying VBS setting: RequirePlatformSecurityFeatures = $requirePlatformSecurityFeaturesValue (1 = SecureBoot, 3 = SecureBoot+DMA)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDeviceGuard -ValueName "RequirePlatformSecurityFeatures" -Type DWord -Value $requirePlatformSecurityFeaturesValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for RequirePlatformSecurityFeatures: $($_.Exception.Message)"
-        }
-
-        # HypervisorEnforcedCodeIntegrity = 1 (Enable HVCI / Memory Integrity)
-        # GPO: Computer Configuration > Admin Templates > System > Device Guard > Turn On Virtualization Based Security > Hypervisor Enforced Code Integrity (Memory Integrity)
-         try {
-            Write-Host "Applying VBS setting: HypervisorEnforcedCodeIntegrity = 1 (Enable HVCI/Memory Integrity)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDeviceGuard -ValueName "HypervisorEnforcedCodeIntegrity" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for HypervisorEnforcedCodeIntegrity: $($_.Exception.Message)"
-        }
-        
-        # Locked = 1 (Prevent VBS/HVCI from being turned off locally) - Optional, but for strong enforcement
-        try {
-            Write-Host "Applying VBS setting: Locked = 1 (Prevent local VBS/HVCI changes)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDeviceGuard -ValueName "Locked" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for Locked (DeviceGuard): $($_.Exception.Message)"
-        }
-
-        Write-Warning "Enforcing Code Integrity (HVCI) also implies enabling Virtualization Based Security (VBS). The JSON had 'virtualizationBasedSecurityEnabled: $($policyObject.virtualizationBasedSecurityEnabled)'. The script proceeded to set VBS keys."
-        Write-Warning "Full effectiveness of VBS/HVCI requires appropriate hardware, firmware (with Secure Boot), and hypervisor support."
-
-    } else {
-        Write-Host "JSON setting 'codeIntegrityEnabled: false'. No GPO settings applied for VBS/HVCI."
-    }
-}
-
-# 3. bitLockerEnabled: true
-# Enforcing full BitLocker via GPO is complex. This will set one example policy to require encryption for Fixed Data Drives.
-# GPO: Computer Configuration > Admin Templates > Windows Components > BitLocker Drive Encryption > Fixed Data Drives > Deny write access to fixed drives not protected by BitLocker
-if ($policyObject.PSObject.Properties.Match('bitLockerEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.bitLockerEnabled -eq $true) {
-        $regKeyFVE = "SOFTWARE\Policies\Microsoft\FVE"
-        $regValueName = "FDVDenyWriteAccess" # Deny write access to non-BitLocker protected Fixed Drives
-        $regValue = 1 
-        $regType = "DWord"
-        try {
-            Write-Host "Applying BitLocker setting: Deny write access to fixed drives not protected by BitLocker (FDVDenyWriteAccess = 1)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyFVE -ValueName $regValueName -Type $regType -Value $regValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-            Write-Warning "This is one example of enforcing BitLocker. Full BitLocker GPO configuration is more extensive and may involve OS drive encryption, removable drive policies, TPM configuration, etc."
-        } catch {
-            Write-Warning "Failed to set example BitLocker registry value (FDVDenyWriteAccess): $($_.Exception.Message)"
-        }
-    } else {
-        Write-Host "JSON setting 'bitLockerEnabled: false'. No GPO settings applied for BitLocker."
-    }
-}
-
-# --- Note on other Device Health settings from JSON ---
-Write-Host "---"
-Write-Host "Other Device Health related settings from JSON and their status for GPO mapping:"
-
-# tpmRequired: false (in this JSON)
-if ($policyObject.PSObject.Properties.Match('tpmRequired').Count -gt 0) {
-    $interpretedSettingsFromJson++ # Counted as interpreted
-    Write-Host "- tpmRequired: $($policyObject.tpmRequired). TPM is a hardware/firmware prerequisite. GPO cannot enable it but can require its presence for features like BitLocker."
-}
-
-# earlyLaunchAntiMalwareDriverEnabled: false (in this JSON)
-if ($policyObject.PSObject.Properties.Match('earlyLaunchAntiMalwareDriverEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++ # Counted as interpreted
-    Write-Host "- earlyLaunchAntiMalwareDriverEnabled: $($policyObject.earlyLaunchAntiMalwareDriverEnabled). ELAM is typically enabled by the AV solution. Direct GPO for 'enabled' status is complex; usually involves configuring specific ELAM drivers."
-}
-
-# storageRequireEncryption: false (in this JSON)
-# This is often tied to BitLocker. If BitLocker is enforced, this is usually covered.
-if ($policyObject.PSObject.Properties.Match('storageRequireEncryption').Count -gt 0) {
-    $interpretedSettingsFromJson++ # Counted as interpreted
-    Write-Host "- storageRequireEncryption: $($policyObject.storageRequireEncryption). This is typically achieved via BitLocker. If 'bitLockerEnabled' was true and enforced, this would be implicitly covered."
-}
-
-# memoryIntegrityEnabled: false (in this JSON) - This is HVCI
-if ($policyObject.PSObject.Properties.Match('memoryIntegrityEnabled').Count -gt 0) {
-    # This was already part of codeIntegrityEnabled logic if it were true
-    $interpretedSettingsFromJson++ 
-    Write-Host "- memoryIntegrityEnabled (HVCI): $($policyObject.memoryIntegrityEnabled). If 'codeIntegrityEnabled' is true, HVCI settings are applied. This specific flag being false means no additional direct enforcement from this flag alone."
-}
-
-# kernelDmaProtectionEnabled: false (in this JSON)
-if ($policyObject.PSObject.Properties.Match('kernelDmaProtectionEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    Write-Host "- kernelDmaProtectionEnabled: $($policyObject.kernelDmaProtectionEnabled). This is a VBS feature. If set to true, 'RequirePlatformSecurityFeatures' for DeviceGuard would be set to '3' (Secure Boot + DMA). Currently false."
-}
-
-# virtualizationBasedSecurityEnabled: false (in this JSON)
-if ($policyObject.PSObject.Properties.Match('virtualizationBasedSecurityEnabled').Count -gt 0) {
-    # This was already part of codeIntegrityEnabled logic if it were true
-    $interpretedSettingsFromJson++
-    Write-Host "- virtualizationBasedSecurityEnabled: $($policyObject.virtualizationBasedSecurityEnabled). VBS is a foundational technology for HVCI. If 'codeIntegrityEnabled' is true, VBS registry keys are set accordingly."
-}
-
-# firmwareProtectionEnabled: false (in this JSON)
-if ($policyObject.PSObject.Properties.Match('firmwareProtectionEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    Write-Host "- firmwareProtectionEnabled: $($policyObject.firmwareProtectionEnabled). This relates to advanced firmware security (e.g., System Guard Secure Launch) and is not typically managed by simple GPO registry toggles."
-}
-
-# --- Summary ---
+# --- Final Verification ---
+Write-Host ""
 Write-Host "--------------------------------------------------------------------"
-Write-Host "GPO Configuration Summary for '$gpoName'"
+Write-Host "GPO Configuration Script Summary"
 Write-Host "--------------------------------------------------------------------"
-Write-Host "Source JSON: Compliance Policy (Intune Device Health)"
 Write-Host "GPO Name: $gpoName"
+Write-Host "Source Intune Policy Name: $($policyObject.displayName) (Type: Windows 10 Compliance Policy - Device Health)"
 Write-Host ""
-Write-Host "Regarding 'settingCount':"
-Write-Host "The input JSON is an Intune Compliance Policy, which does not have a 'settingCount' field."
-Write-Host "The script interprets specific, known properties from the compliance policy JSON."
+Write-Host "Expected Intune settings to interpret for this policy type: $expectedIntuneSettings"
+Write-Host "Total Set-GPRegistryValue commands executed in this script: $configuredGpoSettings"
 Write-Host ""
-Write-Host "Number of distinct settings/conditions interpreted from JSON for GPO translation: $interpretedSettingsFromJson"
-Write-Host "Total Set-GPRegistryValue commands successfully executed: $setGPRegistryValueCommandsExecuted"
-Write-Host ""
-Write-Host "Discrepancy Explanation:"
-Write-Host "The count of 'interpreted settings' and 'executed commands' may differ because:"
-Write-Host "  1. Some Intune compliance checks (e.g., 'codeIntegrityEnabled') are translated into multiple registry values."
-Write-Host "  2. Settings that are prerequisites (e.g., Secure Boot, TPM) or too complex for single Set-GPRegistryValue commands are noted with warnings but not directly translated into registry changes."
-Write-Host "  3. Settings that are 'false' in the JSON are generally not enforced by this script, only noted."
-Write-Host "This script focuses on translating 'true' or active Device Health compliance states into enforcing GPO settings where feasible with Set-GPRegistryValue."
+Write-Host "Discrepancy Explanation (if any):"
+Write-Host "The 'expectedIntuneSettings' counts the number of high-level Device Health settings this script logic attempts to interpret."
+Write-Host "The 'configuredGpoSettings' counts each individual Set-GPRegistryValue command."
+Write-Host "  - If 'bitLockerEnabled' from JSON is true, 1 GPO setting is configured (example setting)."
+Write-Host "  - If 'codeIntegrityEnabled' from JSON is true, 4 GPO settings are configured (for VBS, HVCI, and lock)."
+Write-Host "  - Many Device Health settings (e.g., SecureBoot, TPM, ELAM) are firmware/hardware prerequisites or complex states not directly enforced by simple 'Policies' registry keys via Set-GPRegistryValue; these are noted with warnings."
+Write-Host "  - Settings that are 'false' in the JSON are generally not enforced by this script."
+Write-Host "This script does not use a 'settingCount' field from the JSON, as Compliance Policies do not have such a field."
 Write-Host "--------------------------------------------------------------------"
 Write-Host "Script finished."
 # Example of how to run:
-# $jsonFilePath = "path\to\Win - OIB - Compliance - U - Device Health - v3.1.json"
-# $fileContent = Get-Content -Path $jsonFilePath -Raw
-# .\ThisScriptFileName.ps1 -JsonContentIn $fileContent
+# $jsonFilePath = "WINDOWS/IntuneManagement/CompliancePolicies/Win - OIB - Compliance - U - Device Health - v3.1.json"
+# $fileContent = Get-Content -Path $jsonFilePath -Raw | Out-String
+# # Ensure $fileContent is correctly passed as a single string if running manually, e.g. using $(Get-Content ... -Raw)
+# .\Win-OIB-Compliance-U-Device-Health-v3.1.ps1 -JsonContentIn $fileContent

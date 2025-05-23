@@ -1,12 +1,25 @@
-# Script to create GPO from Intune Windows Health Monitoring Configuration JSON
-
-#Requires -Modules GroupPolicy
-
+<#
+.SYNOPSIS
+    Creates and configures a Group Policy Object (GPO) based on settings from an Intune JSON policy.
+.DESCRIPTION
+    This script reads an Intune JSON policy export for 'Win - OIB - TP - Health Monitoring - D - Endpoint Analytics - v3.4',
+    extracts relevant Endpoint Analytics / Windows Health Monitoring settings, and creates a corresponding GPO.
+    It attempts to map these settings to GPO registry values where feasible using Set-GPRegistryValue.
+    This script is self-contained and uses the provided JSON content directly.
+    It is designed to interpret specific fields from the known JSON structure of a WindowsHealthMonitoringConfiguration.
+.NOTES
+    Source Policy Name: Win - OIB - TP - Health Monitoring - D - Endpoint Analytics - v3.4
+    Version: 1.1
+    Author: AI Agent
+#>
 param (
     [string]$JsonContentIn
 )
 
-# Helper function to clean the JSON content
+# Strict error handling
+$ErrorActionPreference = 'Stop'
+
+# Helper function to clean the JSON content (UTF-16 BOM and null characters)
 function Clean-JsonContent {
     param ([string]$RawContent)
     $cleaned = $RawContent
@@ -17,21 +30,26 @@ function Clean-JsonContent {
     return $cleaned
 }
 
-# Initialize
-$setGPRegistryValueCommandsExecuted = 0
-$interpretedSettingsFromJson = 0 # Counts relevant settings from JSON
+# --- Initialize Counters ---
+# $expectedIntuneSettings: Number of Intune settings this script is programmed to interpret from this specific JSON.
+# For this WindowsHealthMonitoringConfiguration, we are looking for:
+# 1. allowDeviceHealthMonitoring
+# 2. configDeviceHealthMonitoringScope
+# 3. configDeviceHealthMonitoringCustomScope (though often null)
+$expectedIntuneSettings = 3 
+$configuredGpoSettings = 0 # Counts successfully configured GPO registry values.
 
-# Clean and Parse JSON
+# --- Parse JSON ---
 $cleanedJson = Clean-JsonContent -RawContent $JsonContentIn
 try {
     $policyObject = $cleanedJson | ConvertFrom-Json -ErrorAction Stop
 } catch {
     Write-Error "Failed to parse JSON content. Error: $($_.Exception.Message)"
-    Write-Error "Cleaned JSON content (first 500 chars): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 500)))"
-    exit 1
+    Write-Error "Cleaned JSON content (first 500 chars for debugging): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 500)))"
+    exit 1 
 }
 
-# Extract GPO Name and Description
+# --- Extract GPO Information ---
 $gpoName = $policyObject.displayName
 $gpoDescription = $policyObject.description
 if ([string]::IsNullOrEmpty($gpoDescription)) {
@@ -41,109 +59,103 @@ if ([string]::IsNullOrEmpty($gpoDescription)) {
 Write-Host "Preparing to create GPO: '$gpoName'"
 Write-Host "Description: '$gpoDescription'"
 
-# Create New GPO
+# --- Main GPO Configuration ---
 try {
-    Import-Module GroupPolicy -ErrorAction Stop
+    Import-Module GroupPolicy -ErrorAction Stop 
+
     $existingGpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
     if ($existingGpo) {
         Write-Warning "GPO named '$gpoName' already exists. Script will not create a new one or modify the existing one. Exiting."
-        exit 1
-    } else {
-        $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription -ErrorAction Stop
-        Write-Host "Successfully created GPO: '$($gpo.DisplayName)' (ID: $($gpo.Id))"
+        exit 1 
     }
+
+    $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription
+    Write-Host "Successfully created GPO: '$($gpo.DisplayName)' (ID: $($gpo.Id))"
+
+    # Define base registry paths
+    $dataCollectionRegPath = "SOFTWARE\Policies\Microsoft\Windows\DataCollection"
+
+    # Setting 1: allowDeviceHealthMonitoring
+    # Intune Setting: allowDeviceHealthMonitoring (Value from JSON: $($policyObject.allowDeviceHealthMonitoring))
+    if ($policyObject.PSObject.Properties.Contains('allowDeviceHealthMonitoring')) {
+        if ($policyObject.allowDeviceHealthMonitoring -eq "enabled") {
+            # GPO Path: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow device health monitoring
+            # Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowDeviceHealthMonitoring (DWORD)
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $dataCollectionRegPath -ValueName "AllowDeviceHealthMonitoring" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for allowDeviceHealthMonitoring: $dataCollectionRegPath\AllowDeviceHealthMonitoring = 1"
+
+            # For Endpoint Analytics to function, commercial data pipeline must also be allowed.
+            # GPO Path: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow commercial data pipeline
+            # Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowCommercialDataPipeline (DWORD)
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $dataCollectionRegPath -ValueName "AllowCommercialDataPipeline" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting (related): $dataCollectionRegPath\AllowCommercialDataPipeline = 1"
+            
+            # Endpoint Analytics requires at least Basic telemetry.
+            # GPO Path: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow Telemetry
+            # Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowTelemetry (DWORD) 
+            # Values: 0 = Off, 1 = Basic/Required, 2 = Enhanced (deprecated), 3 = Full/Optional
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $dataCollectionRegPath -ValueName "AllowTelemetry" -Type DWord -Value 1 -ErrorAction Stop # Set to 1 for Basic
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting (related): $dataCollectionRegPath\AllowTelemetry = 1 (Basic)"
+        } else {
+            Write-Warning "Intune setting 'allowDeviceHealthMonitoring' is '$($policyObject.allowDeviceHealthMonitoring)'. This script enforces the 'enabled' state. GPO settings not applied to enforce 'disabled'."
+        }
+    } else {
+        Write-Warning "Intune setting 'allowDeviceHealthMonitoring' not found in JSON. Expected for this policy type."
+    }
+
+    # Setting 2: configDeviceHealthMonitoringScope
+    # Intune Setting: configDeviceHealthMonitoringScope (Value from JSON: $($policyObject.configDeviceHealthMonitoringScope))
+    # GPO Equivalent: The specific scopes (e.g., 'bootPerformance', 'windowsUpdates') don't map one-to-one to easily configurable
+    # Set-GPRegistryValue keys beyond the general telemetry enablement above.
+    if ($policyObject.PSObject.Properties.Contains('configDeviceHealthMonitoringScope')) {
+        $scopeValue = $policyObject.configDeviceHealthMonitoringScope
+        Write-Warning "Intune setting 'configDeviceHealthMonitoringScope' is '$scopeValue'."
+        Write-Warning "The general GPO settings for enabling device health monitoring and telemetry (AllowDeviceHealthMonitoring, AllowCommercialDataPipeline, AllowTelemetry) have been applied."
+        Write-Warning "Specific GPO registry keys for granular Intune scopes like '$scopeValue' via Set-GPRegistryValue are limited. The enabled telemetry level and health monitoring should cover data points for Endpoint Analytics. For more fine-grained control, review dedicated GPO settings for Data Collection and Preview Builds which might not be simple registry flags."
+    } else {
+        Write-Warning "Intune setting 'configDeviceHealthMonitoringScope' not found in JSON."
+    }
+    
+    # Setting 3: configDeviceHealthMonitoringCustomScope
+    # Intune Setting: configDeviceHealthMonitoringCustomScope (Value from JSON: $($policyObject.configDeviceHealthMonitoringCustomScope))
+    if ($policyObject.PSObject.Properties.Contains('configDeviceHealthMonitoringCustomScope')) {
+        if ($null -ne $policyObject.configDeviceHealthMonitoringCustomScope) {
+             Write-Warning "Intune setting 'configDeviceHealthMonitoringCustomScope' has a value: '$($policyObject.configDeviceHealthMonitoringCustomScope)'. Custom scopes are not translated by this script."
+        } else {
+            Write-Host "Intune setting 'configDeviceHealthMonitoringCustomScope' is null. No action taken."
+        }
+    } else {
+        Write-Warning "Intune setting 'configDeviceHealthMonitoringCustomScope' not found in JSON."
+    }
+    
 } catch {
-    Write-Error "Failed to create GPO '$gpoName'. Error: $($_.Exception.Message)"
-    exit 1
+    Write-Error "An error occurred during GPO creation or configuration: $($_.Exception.Message)"
 }
 
-# --- Registry Settings Mapping for Endpoint Analytics / Health Monitoring ---
-$regKeyDataCollection = "SOFTWARE\Policies\Microsoft\Windows\DataCollection"
-
-# 1. allowDeviceHealthMonitoring: "enabled"
-# GPO: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow Telemetry
-# Also: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow device health monitoring
-# Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowDeviceHealthMonitoring (DWORD)
-if ($policyObject.PSObject.Properties.Match('allowDeviceHealthMonitoring').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.allowDeviceHealthMonitoring -eq "enabled") {
-        try {
-            Write-Host "Applying setting: AllowDeviceHealthMonitoring = 1"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDataCollection -ValueName "AllowDeviceHealthMonitoring" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for AllowDeviceHealthMonitoring: $($_.Exception.Message)"
-        }
-
-        # Endpoint Analytics also requires "Allow commercial data pipeline"
-        # GPO: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow commercial data pipeline
-        # Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowCommercialDataPipeline (DWORD)
-        try {
-            Write-Host "Applying setting: AllowCommercialDataPipeline = 1"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDataCollection -ValueName "AllowCommercialDataPipeline" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for AllowCommercialDataPipeline: $($_.Exception.Message)"
-        }
-        
-        # Endpoint Analytics requires at least Basic telemetry.
-        # GPO: Computer Configuration > Admin Templates > Windows Components > Data Collection and Preview Builds > Allow Telemetry
-        # Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowTelemetry (DWORD) 
-        # Values: 0 = Off (not recommended), 1 = Basic/Required, 2 = Enhanced (deprecated), 3 = Full/Optional
-        # We set to 1 for Basic as a minimum for Endpoint Analytics.
-        try {
-            Write-Host "Applying setting: AllowTelemetry = 1 (Basic)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyDataCollection -ValueName "AllowTelemetry" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for AllowTelemetry: $($_.Exception.Message)"
-        }
-
-    } else {
-        Write-Warning "JSON setting 'allowDeviceHealthMonitoring' is 'disabled'. Endpoint Analytics GPO settings will not be applied to disable it, as the script's intent is to map enabled features. To disable, set AllowDeviceHealthMonitoring to 0."
-    }
-} else {
-    Write-Warning "JSON field 'allowDeviceHealthMonitoring' not found. Skipping related GPO settings."
-}
-
-# 2. configDeviceHealthMonitoringScope
-# This Intune setting (e.g., "bootPerformance", "windowsUpdates") does not have a direct one-to-one mapping to a single GPO registry key
-# that Set-GPRegistryValue can easily configure with the same granularity.
-# The settings above (AllowDeviceHealthMonitoring, AllowCommercialDataPipeline, AllowTelemetry) enable the general data flow.
-# Specific data scopes are often implicitly included with these broader settings or require more complex configurations.
-if ($policyObject.PSObject.Properties.Match('configDeviceHealthMonitoringScope').Count -gt 0) {
-    $interpretedSettingsFromJson++ # Counted as an interpreted setting from JSON
-    $scope = $policyObject.configDeviceHealthMonitoringScope
-    Write-Warning "JSON setting 'configDeviceHealthMonitoringScope: $scope'. The general health monitoring and telemetry settings have been applied."
-    Write-Warning "Specific GPO registry keys for granular scopes like '$scope' via Set-GPRegistryValue are limited. Ensure the 'AllowTelemetry' level (set to Basic) and 'AllowDeviceHealthMonitoring' cover necessary data points for the intended scope. For more granular control, review dedicated GPO settings for Data Collection and Preview Builds which might not be simple registry flags."
-    if ($policyObject.PSObject.Properties.Match('configDeviceHealthMonitoringCustomScope').Count -gt 0 -and $policyObject.configDeviceHealthMonitoringCustomScope -ne $null) {
-        Write-Warning "Additionally, 'configDeviceHealthMonitoringCustomScope' was specified: $($policyObject.configDeviceHealthMonitoringCustomScope). Custom scopes are not translated by this script."
-         $interpretedSettingsFromJson++ 
-    }
-}
-
-# --- Summary ---
+# --- Final Verification ---
+Write-Host ""
 Write-Host "--------------------------------------------------------------------"
-Write-Host "GPO Configuration Summary for '$gpoName'"
+Write-Host "GPO Configuration Script Summary"
 Write-Host "--------------------------------------------------------------------"
-Write-Host "Source JSON: Windows Health Monitoring Configuration (Intune)"
 Write-Host "GPO Name: $gpoName"
+Write-Host "Source Intune Policy Name: $($policyObject.displayName) (Type: WindowsHealthMonitoringConfiguration)"
 Write-Host ""
-Write-Host "Regarding 'settingCount':"
-Write-Host "The input JSON is a specific Intune template type (WindowsHealthMonitoringConfiguration) which does not have a generic 'settings' array or a 'settingCount' field at its root."
-Write-Host "Instead, the script interprets specific, known properties from this JSON template."
-Write-Host ""
-Write-Host "Number of distinct settings/properties interpreted from JSON for GPO translation: $interpretedSettingsFromJson"
-Write-Host "Total Set-GPRegistryValue commands successfully executed: $setGPRegistryValueCommandsExecuted"
+Write-Host "Expected Intune settings to interpret for this policy type: $expectedIntuneSettings (allowDeviceHealthMonitoring, configDeviceHealthMonitoringScope, configDeviceHealthMonitoringCustomScope)"
+Write-Host "Total Set-GPRegistryValue commands successfully executed in this script: $configuredGpoSettings"
 Write-Host ""
 Write-Host "Discrepancy Explanation (if any):"
-Write-Host "The count of 'interpreted settings' and 'executed commands' may differ because:"
-Write-Host "  1. One Intune property (like 'allowDeviceHealthMonitoring') might translate to multiple registry values to ensure all necessary GPO prerequisites for Endpoint Analytics are met (e.g., AllowDeviceHealthMonitoring, AllowCommercialDataPipeline, AllowTelemetry)."
-Write-Host "  2. Some Intune settings (like 'configDeviceHealthMonitoringScope') have limited direct GPO registry equivalents for the same level of granularity via simple Set-GPRegistryValue commands, so a warning is issued instead of direct mapping for the specific scope value."
-Write-Host "This script focuses on enabling the core functionality for Endpoint Analytics data collection via available GPO registry keys."
+Write-Host "The 'expectedIntuneSettings' counts the number of high-level properties this script logic attempts to map from the specific JSON structure."
+Write-Host "The 'configuredGpoSettings' counts each individual Set-GPRegistryValue command."
+Write-Host "  - If 'allowDeviceHealthMonitoring' from JSON is 'enabled', 3 GPO settings are configured (AllowDeviceHealthMonitoring, AllowCommercialDataPipeline, AllowTelemetry)."
+Write-Host "  - 'configDeviceHealthMonitoringScope' and 'configDeviceHealthMonitoringCustomScope' do not directly translate to distinct Set-GPRegistryValue commands beyond the general enablement and result in warnings."
+Write-Host "This script does not use a 'settingCount' field from the JSON root, as this specific Device Configuration type does not have one."
 Write-Host "--------------------------------------------------------------------"
 Write-Host "Script finished."
 # Example of how to run:
-# $jsonFilePath = "path\to\Win - OIB - TP - Health Monitoring - D - Endpoint Analytics - v3.4.json"
-# $fileContent = Get-Content -Path $jsonFilePath -Raw
-# .\ThisScriptFileName.ps1 -JsonContentIn $fileContent
+# $jsonFilePath = "WINDOWS/IntuneManagement/DeviceConfiguration/Win - OIB - TP - Health Monitoring - D - Endpoint Analytics - v3.4.json"
+# $fileContent = Get-Content -Path $jsonFilePath -Raw | Out-String
+# # Ensure $fileContent is correctly passed as a single string if running manually, e.g. using $(Get-Content ... -Raw)
+# .\Win-OIB-TP-Health-Monitoring-D-Endpoint-Analytics-v3.4.ps1 -JsonContentIn $fileContent

@@ -1,266 +1,198 @@
-# Script to create GPO from Intune Compliance Policy JSON
-
-#Requires -Modules GroupPolicy
-
+<#
+.SYNOPSIS
+    Creates and configures a Group Policy Object (GPO) based on settings from an Intune JSON policy.
+.DESCRIPTION
+    This script reads an Intune JSON policy export for 'Win - OIB - Compliance - U - Defender for Endpoint - v3.1',
+    extracts relevant settings, and creates a corresponding GPO with those settings applied as registry values.
+    It focuses on Defender Antivirus related configurations.
+    This script is self-contained and uses the provided JSON content directly.
+    It is designed to interpret specific fields from the known JSON structure of a Windows 10 Compliance Policy.
+.NOTES
+    Source Policy Name: Win - OIB - Compliance - U - Defender for Endpoint - v3.1
+    Version: 1.1
+    Author: AI Agent
+#>
 param (
     [string]$JsonContentIn
 )
 
-# Helper function to clean the JSON content
+# Strict error handling
+$ErrorActionPreference = 'Stop'
+
+# Helper function to clean the JSON content (UTF-16 BOM and null characters)
 function Clean-JsonContent {
     param ([string]$RawContent)
-    # Remove BOM (ÿþ) if present at the beginning
     $cleaned = $RawContent
     if ($cleaned.StartsWith("ÿþ")) {
         $cleaned = $cleaned.Substring(2)
     }
-    # Remove null characters that are interspersed in UTF-16 strings
     $cleaned = $cleaned.Replace([char]0, "")
     return $cleaned
 }
 
-# Initialize
-$setGPRegistryValueCommandsExecuted = 0
-$interpretedSettingsFromJson = 0 # This will count how many settings from the JSON we attempt to translate
+# --- Initialize Counters ---
+# $expectedIntuneSettings: Number of Intune settings this script is programmed to interpret from this specific JSON.
+# For this Defender for Endpoint compliance policy, we are looking for:
+# 1. defenderEnabled
+# 2. rtpEnabled
+# 3. signatureOutOfDate
+$expectedIntuneSettings = 3 
+$configuredGpoSettings = 0 # Counts successfully configured GPO registry values.
 
-# Clean and Parse JSON
-Write-Host "Raw JSON input length: $($JsonContentIn.Length)"
+# --- Parse JSON ---
 $cleanedJson = Clean-JsonContent -RawContent $JsonContentIn
-Write-Host "Cleaned JSON content (first 200 chars): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 200)))"
-
 try {
     $policyObject = $cleanedJson | ConvertFrom-Json -ErrorAction Stop
 } catch {
     Write-Error "Failed to parse JSON content. Error: $($_.Exception.Message)"
-    Write-Error "Cleaned JSON content (first 500 chars): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 500)))"
-    # It might be useful to see more of the JSON if parsing fails
-    # For security reasons, avoid printing the full JSON if it's very large or contains sensitive data not expected here.
-    exit 1
+    Write-Error "Cleaned JSON content (first 500 chars for debugging): $($cleanedJson.Substring(0, [System.Math]::Min($cleanedJson.Length, 500)))"
+    exit 1 # Exit if JSON parsing fails
 }
 
-# Extract GPO Name and Description
+# --- Extract GPO Information ---
 $gpoName = $policyObject.displayName
-$gpoDescription = $policyObject.description # This is null in the provided JSON
+$gpoDescription = $policyObject.description
 if ([string]::IsNullOrEmpty($gpoDescription)) {
-    $gpoDescription = "GPO created from Intune compliance policy '$gpoName' (Automated Script)"
+    $gpoDescription = "Policy description from Intune JSON. GPO created from Intune policy '$gpoName' (Defender for Endpoint Compliance - Automated Script)"
 }
 
 Write-Host "Preparing to create GPO: '$gpoName'"
 Write-Host "Description: '$gpoDescription'"
 
-# Create New GPO
+# --- Main GPO Configuration ---
 try {
-    Import-Module GroupPolicy -ErrorAction Stop
+    Import-Module GroupPolicy -ErrorAction Stop # Ensures GPO cmdlets are available
+
     # Check if GPO already exists
     $existingGpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
     if ($existingGpo) {
-        Write-Warning "GPO named '$gpoName' already exists. Script will not create a new one or modify existing."
-        # Or, optionally, remove it and recreate, or just modify. For now, we stop.
-        # Remove-GPO -Name $gpoName -Force
-        # $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription -ErrorAction Stop
-        Write-Warning "Exiting to prevent changes to existing GPO."
-        exit 1 # Or handle as appropriate
-    } else {
-        $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription -ErrorAction Stop
-        Write-Host "Successfully created GPO: '$($gpo.DisplayName)' (ID: $($gpo.Id))"
+        Write-Warning "GPO named '$gpoName' already exists. Script will not create a new one or modify the existing one. Exiting."
+        exit 1 # Stop script if GPO exists to prevent unintended changes
     }
+
+    $gpo = New-Gpo -Name $gpoName -Comment $gpoDescription
+    Write-Host "Successfully created GPO: '$($gpo.DisplayName)' (ID: $($gpo.Id))"
+
+    # Define base registry paths
+    $defenderRegPath = "SOFTWARE\Policies\Microsoft\Windows Defender"
+    $rtpRegPath = "$defenderRegPath\Real-Time Protection"
+    $signatureRegPath = "$defenderRegPath\Signature Updates"
+    $scanRegPath = "$defenderRegPath\Scan"
+
+    # Setting 1: defenderEnabled
+    # Intune Setting: defenderEnabled (Value from JSON: $($policyObject.defenderEnabled))
+    # GPO Path: Computer Configuration > Administrative Templates > Windows Components > Microsoft Defender Antivirus > Turn off Microsoft Defender Antivirus
+    if ($policyObject.PSObject.Properties.Contains('defenderEnabled')) {
+        if ($policyObject.defenderEnabled -eq $true) {
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $defenderRegPath -ValueName "DisableAntiSpyware" -Type DWord -Value 0 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for defenderEnabled: $defenderRegPath\DisableAntiSpyware = 0 (Defender Antivirus Enabled)"
+        } else {
+            Write-Warning "Intune setting 'defenderEnabled' is '$($policyObject.defenderEnabled)'. This script enforces 'true' states for Defender components. 'DisableAntiSpyware' not set to enforce 'false'."
+        }
+    } else {
+        Write-Warning "Intune setting 'defenderEnabled' not found in JSON. Expected for this policy type."
+    }
+
+    # Setting 2: rtpEnabled (Real-Time Protection)
+    # Intune Setting: rtpEnabled (Value from JSON: $($policyObject.rtpEnabled))
+    if ($policyObject.PSObject.Properties.Contains('rtpEnabled')) {
+        if ($policyObject.rtpEnabled -eq $true) {
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Real-time Protection > Turn off real-time protection
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $rtpRegPath -ValueName "DisableRealtimeMonitoring" -Type DWord -Value 0 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for rtpEnabled (DisableRealtimeMonitoring): $rtpRegPath\DisableRealtimeMonitoring = 0 (Real-Time Monitoring Enabled)"
+
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Real-time Protection > Turn on behavior monitoring
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $rtpRegPath -ValueName "DisableBehaviorMonitoring" -Type DWord -Value 0 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for rtpEnabled (DisableBehaviorMonitoring): $rtpRegPath\DisableBehaviorMonitoring = 0 (Behavior Monitoring Enabled)"
+            
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Real-time Protection > Scan all downloaded files and attachments
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $rtpRegPath -ValueName "DisableIOAVProtection" -Type DWord -Value 0 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for rtpEnabled (DisableIOAVProtection): $rtpRegPath\DisableIOAVProtection = 0 (Scan All Downloads Enabled)"
+
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Real-time Protection > Monitor file and program activity on your computer
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $rtpRegPath -ValueName "DisableOnAccessProtection" -Type DWord -Value 0 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for rtpEnabled (DisableOnAccessProtection): $rtpRegPath\DisableOnAccessProtection = 0 (On-Access Protection Enabled)"
+        } else {
+            Write-Warning "Intune setting 'rtpEnabled' is '$($policyObject.rtpEnabled)'. This script enforces 'true' states for RTP components. GPO settings for Real-Time Protection components not applied to enforce 'false'."
+        }
+    } else {
+        Write-Warning "Intune setting 'rtpEnabled' not found in JSON. Expected for this policy type."
+    }
+
+    # Setting 3: signatureOutOfDate (True means signatures must NOT be out of date)
+    # Intune Setting: signatureOutOfDate (Value from JSON: $($policyObject.signatureOutOfDate))
+    if ($policyObject.PSObject.Properties.Contains('signatureOutOfDate')) {
+        if ($policyObject.signatureOutOfDate -eq $true) {
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Signature Updates > Specify the interval to check for definition updates
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $signatureRegPath -ValueName "SignatureUpdateInterval" -Type DWord -Value 4 -ErrorAction Stop # Example: 4 hours
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for signatureOutOfDate (SignatureUpdateInterval): $signatureRegPath\SignatureUpdateInterval = 4"
+
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Signature Updates > Define the order of sources for downloading definitions
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $signatureRegPath -ValueName "FallbackOrder" -Type String -Value "MicrosoftUpdateServer|InternalDefinitionUpdateServer|MMPC" -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for signatureOutOfDate (FallbackOrder): $signatureRegPath\FallbackOrder = 'MicrosoftUpdateServer|InternalDefinitionUpdateServer|MMPC'"
+            
+            # GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Scan > Check for new virus and spyware definitions before scanning
+            Set-GPRegistryValue -Name $gpo.DisplayName -Key $scanRegPath -ValueName "CheckForSignaturesBeforeRunningScan" -Type DWord -Value 1 -ErrorAction Stop
+            $configuredGpoSettings++
+            Write-Host "Applied GPO Setting for signatureOutOfDate (CheckForSignaturesBeforeRunningScan): $scanRegPath\CheckForSignaturesBeforeRunningScan = 1"
+        } else {
+            Write-Warning "Intune setting 'signatureOutOfDate' is '$($policyObject.signatureOutOfDate)'. This script enforces the 'true' state (signatures must be up-to-date). GPO settings for signature updates not applied to reflect 'false'."
+        }
+    } else {
+        Write-Warning "Intune setting 'signatureOutOfDate' not found in JSON. Expected for this policy type."
+    }
+    
+    # Note other settings not directly mapped or enforced by this script
+    Write-Host ""
+    Write-Host "--- Other Intune Compliance Settings Note ---"
+    Write-Host "This script primarily focuses on enforcing Defender AV 'enabled' states based on the specific JSON structure for 'Defender for Endpoint' compliance."
+    Write-Host "Other settings in a typical Windows 10 Compliance Policy (e.g., passwordRequired, bitLockerEnabled, secureBootEnabled, deviceThreatProtectionEnabled, etc.) are either:"
+    Write-Host "  a) Handled by separate dedicated scripts if their JSON files are provided."
+    Write-Host "  b) Not directly translatable to simple Defender AV GPO registry keys for enforcement by *this specific* script's focus."
+    Write-Host "  c) Not present or not 'true' in this particular JSON file."
+    # Example of listing some other common compliance checks and their values from this JSON:
+    $otherComplianceChecks = @("passwordRequired", "bitLockerEnabled", "secureBootEnabled", "codeIntegrityEnabled", "deviceThreatProtectionEnabled", "activeFirewallRequired")
+    foreach ($check in $otherComplianceChecks) {
+        if ($policyObject.PSObject.Properties.Contains($check)) {
+            Write-Host "Intune setting '$check' found with value '$($policyObject.$check)'. This script does not apply GPO settings for this specific compliance check based on the current logic."
+        }
+    }
+
 } catch {
-    Write-Error "Failed to create GPO '$gpoName'. Error: $($_.Exception.Message)"
-    exit 1
+    Write-Error "An error occurred during GPO creation or configuration: $($_.Exception.Message)"
+    # Additional error handling or logging can be added here
 }
 
-# --- Registry Settings Mapping ---
-# This section translates Intune compliance policy settings to GPO registry values.
-# Note: Compliance policies check for a state. GPOs enforce a state.
-# The translation aims to ENFORCE the compliant state.
-
-# 1. defenderEnabled: true
-# Ensures Microsoft Defender Antivirus is enabled.
-# GPO Path: Computer Configuration > Administrative Templates > Windows Components > Microsoft Defender Antivirus > Turn off Microsoft Defender Antivirus
-# Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\DisableAntiSpyware (DWORD)
-# Value: 0 (to enable Defender, as the GPO setting is "Turn off...")
-if ($policyObject.PSObject.Properties.Match('defenderEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.defenderEnabled -eq $true) {
-        $regKey = "SOFTWARE\Policies\Microsoft\Windows Defender"
-        $regValueName = "DisableAntiSpyware"
-        $regValue = 0
-        $regType = "DWord"
-        try {
-            Write-Host "Applying setting: Enable Defender (DisableAntiSpyware = 0)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKey -ValueName $regValueName -Type $regType -Value $regValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for enabling Defender: $($_.Exception.Message)"
-        }
-    } else {
-        Write-Warning "'defenderEnabled' is false in the JSON. This script enforces 'true' states for Defender components. No GPO setting applied for DisableAntiSpyware."
-        # To enforce 'false', one would set DisableAntiSpyware to 1.
-    }
-} else {
-    Write-Warning "JSON field 'defenderEnabled' not found. Skipping related GPO settings."
-}
-
-
-# 2. rtpEnabled: true
-# Ensures Real-Time Protection is enabled.
-# GPO Path: Computer Configuration > ... > Microsoft Defender Antivirus > Real-time Protection > Turn off real-time protection
-# Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection\DisableRealtimeMonitoring (DWORD)
-# Value: 0 (to enable Real-time Protection)
-if ($policyObject.PSObject.Properties.Match('rtpEnabled').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.rtpEnabled -eq $true) {
-        $regKeyRTP = "SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
-        $regValue = 0 # Common value for enabling features (where 'Disable' is in the name)
-        $regType = "DWord"
-
-        # DisableRealtimeMonitoring = 0 (Enable RTP)
-        try {
-            Write-Host "Applying setting: Enable Real-Time Monitoring (DisableRealtimeMonitoring = 0)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyRTP -ValueName "DisableRealtimeMonitoring" -Type $regType -Value $regValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for DisableRealtimeMonitoring: $($_.Exception.Message)"
-        }
-
-        # Behavior Monitoring: HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection\DisableBehaviorMonitoring (DWORD) = 0
-        # This is a sub-component of RTP. Considered part of the 'rtpEnabled' interpretation.
-        try {
-            Write-Host "Applying setting: Enable Behavior Monitoring (DisableBehaviorMonitoring = 0)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyRTP -ValueName "DisableBehaviorMonitoring" -Type $regType -Value $regValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for DisableBehaviorMonitoring: $($_.Exception.Message)"
-        }
-
-        # Scan All Downloads: HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection\DisableIOAVProtection (DWORD) = 0
-        try {
-            Write-Host "Applying setting: Enable Scan All Downloads (DisableIOAVProtection = 0)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyRTP -ValueName "DisableIOAVProtection" -Type $regType -Value $regValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for DisableIOAVProtection: $($_.Exception.Message)"
-        }
-        
-        # Monitor file and program activity: HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection\DisableOnAccessProtection (DWORD) = 0
-        try {
-            Write-Host "Applying setting: Enable monitoring of file and program activity (DisableOnAccessProtection = 0)"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeyRTP -ValueName "DisableOnAccessProtection" -Type $regType -Value $regValue -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for DisableOnAccessProtection: $($_.Exception.Message)"
-        }
-
-    } else {
-        Write-Warning "'rtpEnabled' is false in the JSON. This script enforces 'true' states for Defender components. No GPO settings applied for Real-Time Protection."
-    }
-} else {
-    Write-Warning "JSON field 'rtpEnabled' not found. Skipping related GPO settings."
-}
-
-
-# 3. signatureOutOfDate: true (This means "Require signatures to be NOT out of date")
-# This implies configuring Defender to update signatures regularly.
-if ($policyObject.PSObject.Properties.Match('signatureOutOfDate').Count -gt 0) {
-    $interpretedSettingsFromJson++
-    if ($policyObject.signatureOutOfDate -eq $true) { # Policy requires signatures to be current
-        $regKeySU = "SOFTWARE\Policies\Microsoft\Windows Defender\Signature Updates"
-        
-        # Setting Signature Update Interval (e.g., every 4 hours)
-        # GPO: Specify the interval to check for definition updates
-        try {
-            Write-Host "Applying setting: Set Signature Update Interval to 4 hours"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeySU -ValueName "SignatureUpdateInterval" -Type DWord -Value 4 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for SignatureUpdateInterval: $($_.Exception.Message)"
-        }
-
-        # Setting Fallback Order (ensure Microsoft Update Server is an option)
-        # GPO: Define the order of sources for downloading definitions
-        try {
-            Write-Host "Applying setting: Set Signature Update Fallback Order"
-            Set-GPRegistryValue -Name $gpoName -Key $regKeySU -ValueName "FallbackOrder" -Type String -Value "MicrosoftUpdateServer|InternalDefinitionUpdateServer|MMPC" -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for FallbackOrder: $($_.Exception.Message)"
-        }
-        
-        # Check for new signatures before scheduled scans
-        # GPO: Check for new virus and spyware definitions before scanning
-        # Registry: HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Scan\CheckForSignaturesBeforeRunningScan (DWORD) = 1
-        try {
-            Write-Host "Applying setting: Check for new signatures before scheduled scans (CheckForSignaturesBeforeRunningScan = 1)"
-            Set-GPRegistryValue -Name $gpoName -Key "SOFTWARE\Policies\Microsoft\Windows Defender\Scan" -ValueName "CheckForSignaturesBeforeRunningScan" -Type DWord -Value 1 -ErrorAction Stop
-            $setGPRegistryValueCommandsExecuted++
-        } catch {
-            Write-Warning "Failed to set registry value for CheckForSignaturesBeforeRunningScan: $($_.Exception.Message)"
-        }
-    } else {
-        Write-Warning "'signatureOutOfDate' is false in the JSON (meaning it's OK for signatures to be out of date). No GPO settings applied for signature updates."
-    }
-} else {
-    Write-Warning "JSON field 'signatureOutOfDate' not found. Skipping related GPO settings."
-}
-
-# --- Placeholder for settings not translated ---
-Write-Host "---"
-Write-Host "The following compliance settings from the JSON were noted but NOT directly translated into Set-GPRegistryValue commands by this script:"
-$unmappedSettings = @(
-    "passwordRequired", "passwordBlockSimple", "passwordRequiredToUnlockFromIdle", "passwordMinutesOfInactivityBeforeLock", 
-    "passwordExpirationDays", "passwordMinimumLength", "passwordMinimumCharacterSetCount", "passwordRequiredType", 
-    "passwordPreviousPasswordBlockCount", "requireHealthyDeviceReport", "osMinimumVersion", "osMaximumVersion", 
-    "mobileOsMinimumVersion", "mobileOsMaximumVersion", "earlyLaunchAntiMalwareDriverEnabled", "bitLockerEnabled", 
-    "secureBootEnabled", "codeIntegrityEnabled", "memoryIntegrityEnabled", "kernelDmaProtectionEnabled", 
-    "virtualizationBasedSecurityEnabled", "firmwareProtectionEnabled", "storageRequireEncryption", "activeFirewallRequired", 
-    "antivirusRequired", "antiSpywareRequired", "deviceThreatProtectionEnabled", 
-    "deviceThreatProtectionRequiredSecurityLevel", "configurationManagerComplianceRequired", "tpmRequired",
-    "deviceCompliancePolicyScript", "validOperatingSystemBuildRanges"
-)
-foreach ($settingName in $unmappedSettings) {
-    if ($policyObject.PSObject.Properties.Match($settingName).Count -gt 0) {
-        $value = $policyObject.$settingName
-        if ($value -is [array]) { $value = $value -join ", " } # Basic array display
-        if ($value -is $null) { $value = "null" }
-        Write-Host "- $settingName: $value"
-         # Increment if we want to count these as "interpreted" even if not mapped
-         # $interpretedSettingsFromJson++ 
-    }
-}
-Write-Host "Reasons for not mapping include: setting is 'false', represents a device state check not directly enforced by a simple registry key, requires complex GPO (e.g., MDE onboarding), or is outside Defender AV scope."
-Write-Host "---"
-
-
-# --- Summary ---
+# --- Final Verification ---
+Write-Host ""
 Write-Host "--------------------------------------------------------------------"
-Write-Host "GPO Configuration Summary for '$gpoName'"
+Write-Host "GPO Configuration Script Summary"
 Write-Host "--------------------------------------------------------------------"
-Write-Host "Source JSON: Compliance Policy (Intune)"
 Write-Host "GPO Name: $gpoName"
+Write-Host "Source Intune Policy Name: $($policyObject.displayName) (Type: Windows 10 Compliance Policy)"
 Write-Host ""
-Write-Host "Regarding 'settingCount':"
-Write-Host "The input JSON is an Intune Compliance Policy, which does not have a 'settingCount' field or a generic 'settings' array with 'settingDefinitionId'/'settingInstance'."
-Write-Host "Therefore, the script interprets specific, known properties from the compliance policy JSON."
+Write-Host "Expected Intune settings to interpret for this policy type: $expectedIntuneSettings (defenderEnabled, rtpEnabled, signatureOutOfDate)"
+Write-Host "Total Set-GPRegistryValue commands executed in this script: $configuredGpoSettings"
 Write-Host ""
-Write-Host "Number of distinct settings/conditions interpreted from JSON for GPO translation: $interpretedSettingsFromJson"
-Write-Host "Total Set-GPRegistryValue commands successfully executed: $setGPRegistryValueCommandsExecuted"
-Write-Host ""
-Write-Host "Discrepancy Explanation:"
-Write-Host "The count of 'interpreted settings' and 'executed commands' may differ because:"
-Write-Host "  1. Some Intune compliance checks (e.g., 'rtpEnabled', 'signatureOutOfDate') are translated into multiple specific registry values to ensure comprehensive GPO enforcement."
-Write-Host "  2. Compliance settings in the JSON that are 'false' (e.g., 'bitLockerEnabled: false') or not applicable for direct GPO registry enforcement are documented but skipped for Set-GPRegistryValue."
-Write-Host "  3. If a property is missing from the JSON, it's skipped."
-Write-Host "This script focuses on translating 'true' or active Defender-related compliance states into enforcing GPO settings."
+Write-Host "Discrepancy Explanation (if any):"
+Write-Host "The 'expectedIntuneSettings' counts the number of high-level settings this script logic attempts to map."
+Write-Host "The 'configuredGpoSettings' counts each individual Set-GPRegistryValue command executed."
+Write-Host "  - If 'defenderEnabled' from JSON is true, 1 GPO setting is configured."
+Write-Host "  - If 'rtpEnabled' from JSON is true, 4 GPO settings are configured (for main RTP and 3 sub-features)."
+Write-Host "  - If 'signatureOutOfDate' from JSON is true, 3 GPO settings are configured."
+Write-Host "If any of these primary Intune settings were 'false', the corresponding GPO settings would not be applied to enforce 'false', potentially leading to a lower '$configuredGpoSettings' count than the maximum possible (8 if all were true)."
+Write-Host "This script does not use a 'settingCount' field from the JSON, as Compliance Policies do not have such a field."
 Write-Host "--------------------------------------------------------------------"
-
-# To use this script:
-# 1. Save it as a .ps1 file.
-# 2. Obtain the Intune Compliance Policy JSON content.
-# 3. Run the script: .\ThisScript.ps1 -JsonContentIn (Get-Content -Raw ./path/to/your/policy.json)
-# Ensure the execution policy allows running scripts and you have GPMC installed (RSAT tools).
-# Example:
-# $jsonFile = "WINDOWS/IntuneManagement/CompliancePolicies/Win - OIB - Compliance - U - Defender for Endpoint - v3.1.json"
-# $jsonString = Get-Content -Path $jsonFile -Raw
-# .\CreateGpoFromIntuneCompliance.ps1 -JsonContentIn $jsonString
-
 Write-Host "Script finished."
+# Example of how to run:
+# $jsonFilePath = "WINDOWS/IntuneManagement/CompliancePolicies/Win - OIB - Compliance - U - Defender for Endpoint - v3.1.json"
+# $fileContent = Get-Content -Path $jsonFilePath -Raw | Out-String 
+# # Ensure $fileContent is correctly passed as a single string if running manually, e.g. using $(Get-Content ... -Raw)
+# .\Win-OIB-Compliance-U-Defender-for-Endpoint-v3.1.ps1 -JsonContentIn $fileContent
